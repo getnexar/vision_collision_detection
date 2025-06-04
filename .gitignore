@@ -53,3 +53,4 @@ desktop.ini
 *.swp
 *.pkl
 *.parquet
+*.csv
