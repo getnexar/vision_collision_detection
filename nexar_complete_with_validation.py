@@ -143,9 +143,11 @@ class VideoClassifier:
            
            self.device = torch.device(f"cuda:{self.local_rank}")
            torch.cuda.set_device(self.device)
-           
+            
            if not dist.is_initialized():
-               dist.init_process_group(backend='nccl')
+                from datetime import timedelta
+                dist.init_process_group(backend='nccl', timeout=timedelta(hours=12))
+
            
            self.is_master = (self.rank == 0)
        else:
@@ -339,73 +341,74 @@ class VideoClassifier:
         return avg_loss
     
     def validate(self):
-       """Comprehensive validation with per-class metrics"""
-       if not self.is_master:
-           return {}
-       
-       # Use non-DDP model for validation
-       model_for_val = self.model.module if hasattr(self.model, 'module') else self.model
-       model_for_val.eval()
-       
-       total_loss = 0.0
-       all_preds = []
-       all_targets = []
-       total_samples = 0
-       
-       with torch.no_grad():
-           for batch in self.val_loader:
-               frames = batch['frames'].permute(0, 4, 1, 2, 3).float().to(self.device)
-               targets = batch['target']
-               
-               if isinstance(targets[0], str):
-                   class_map = {'Normal': 0, 'Near Collision': 1, 'Collision': 2}
-                   targets = torch.tensor([class_map[t] for t in targets]).to(self.device)
-               else:
-                   targets = targets.to(self.device)
-               
-               outputs = model_for_val(frames)
-               loss = self.criterion(outputs, targets)
-               
-               preds = torch.argmax(outputs, dim=1)
-               
-               all_preds.extend(preds.cpu().numpy())
-               all_targets.extend(targets.cpu().numpy())
-               total_loss += loss.item() * targets.size(0)
-               total_samples += targets.size(0)
-               
-               del frames, targets, outputs, loss
-       
-       # Calculate metrics
-       avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
-       accuracy = np.mean(np.array(all_preds) == np.array(all_targets))
-       
-       # Per-class precision, recall, f1
-       precision, recall, f1, _ = precision_recall_fscore_support(
-           all_targets, all_preds, average=None, zero_division=0, labels=[0, 1, 2]
-       )
-       
-       metrics = {
-           'val_loss': avg_loss,
-           'val_accuracy': accuracy,
-           'val_precision_normal': precision[0],
-           'val_precision_near_collision': precision[1],
-           'val_precision_collision': precision[2],
-           'val_recall_normal': recall[0],
-           'val_recall_near_collision': recall[1],
-           'val_recall_collision': recall[2],
-           'val_f1_normal': f1[0],
-           'val_f1_near_collision': f1[1],
-           'val_f1_collision': f1[2]
-       }
-       
-       # Log detailed results
-       self.log(f"Validation Results:")
-       self.log(f"  Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
-       self.log(f"  Per-class Precision: Normal={precision[0]:.4f}, Near Collision={precision[1]:.4f}, Collision={precision[2]:.4f}")
-       self.log(f"  Per-class Recall: Normal={recall[0]:.4f}, Near Collision={recall[1]:.4f}, Collision={recall[2]:.4f}")
-       self.log(f"  Per-class F1: Normal={f1[0]:.4f}, Near Collision={f1[1]:.4f}, Collision={f1[2]:.4f}")
-       
-       return metrics
+        """Comprehensive validation with per-class metrics"""
+        if not self.is_master:
+            return {}
+        self.log(f"Starting validation on {len(self.val_loader)} batches...")
+    
+        # Use non-DDP model for validation
+        model_for_val = self.model.module if hasattr(self.model, 'module') else self.model
+        model_for_val.eval()
+    
+        total_loss = 0.0
+        all_preds = []
+        all_targets = []
+        total_samples = 0
+    
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Validating", disable=not self.is_master):
+                frames = batch['frames'].permute(0, 4, 1, 2, 3).float().to(self.device)
+                targets = batch['target']
+    
+                if isinstance(targets[0], str):
+                    class_map = {'Normal': 0, 'Near Collision': 1, 'Collision': 2}
+                    targets = torch.tensor([class_map[t] for t in targets]).to(self.device)
+                else:
+                    targets = targets.to(self.device)
+    
+                outputs = model_for_val(frames)
+                loss = self.criterion(outputs, targets)
+    
+                preds = torch.argmax(outputs, dim=1)
+    
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(targets.cpu().numpy())
+                total_loss += loss.item() * targets.size(0)
+                total_samples += targets.size(0)
+    
+                del frames, targets, outputs, loss
+    
+        # Calculate metrics
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+        accuracy = np.mean(np.array(all_preds) == np.array(all_targets))
+    
+        # Per-class precision, recall, f1
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_targets, all_preds, average=None, zero_division=0, labels=[0, 1, 2]
+        )
+    
+        metrics = {
+            'val_loss': avg_loss,
+            'val_accuracy': accuracy,
+            'val_precision_normal': precision[0],
+            'val_precision_near_collision': precision[1],
+            'val_precision_collision': precision[2],
+            'val_recall_normal': recall[0],
+            'val_recall_near_collision': recall[1],
+            'val_recall_collision': recall[2],
+            'val_f1_normal': f1[0],
+            'val_f1_near_collision': f1[1],
+            'val_f1_collision': f1[2]
+        }
+    
+        # Log detailed results
+        self.log(f"Validation Results:")
+        self.log(f"  Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+        self.log(f"  Per-class Precision: Normal={precision[0]:.4f}, Near Collision={precision[1]:.4f}, Collision={precision[2]:.4f}")
+        self.log(f"  Per-class Recall: Normal={recall[0]:.4f}, Near Collision={recall[1]:.4f}, Collision={recall[2]:.4f}")
+        self.log(f"  Per-class F1: Normal={f1[0]:.4f}, Near Collision={f1[1]:.4f}, Collision={f1[2]:.4f}")
+    
+        return metrics
     
     def save_training_history_csv(self):
        """Save training history to CSV"""
