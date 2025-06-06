@@ -17,56 +17,479 @@ Usage:
     python nexar_complete_with_validation.py --run-grid-search
 """
 
-import os
-import sys
-import time
-import argparse
+# PyTorch
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
+
+# Standard libraries
+import os
+import sys
+import time
+import argparse
 import logging
-import numpy as np
 import random
 from datetime import datetime
-from sklearn.metrics import precision_recall_fscore_support, classification_report
-# Import your existing modules
-try:
-    from nexar_train import *
-    from nexar_videos import *
-except ImportError as e:
-    print(f"Error importing modules: {e}")
-    print("Make sure nexar_train.py and nexar_videos.py are in the same directory")
-    sys.exit(1)
 
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
+# Third-party libraries
+import numpy as np
+import pandas as pd
+import cv2
+import decord
+from tqdm.auto import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_fscore_support, classification_report
+
+from nexar_video_aug import create_video_transforms
+
+#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
 
 # ========================================================================================
 # SIMPLE VIDEO CLASSIFIER CLASS WITH FIXED VALIDATION
 # ========================================================================================
 
-import os
-import sys
-import time
-import argparse
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from tqdm import tqdm
-import logging
-import numpy as np
-import pandas as pd
-from datetime import datetime
-from sklearn.metrics import precision_recall_fscore_support, classification_report
+class VideoDataset(Dataset):
+    """Clean video dataset for loading video frames"""
 
+    def __init__(self, video_paths, labels, video_ids=None, fps=10, duration=5, 
+                 is_train=True, transform=None, sample_strategy='random', 
+                 center_time_column=None, metadata_df=None):
+        """
+        Args:
+            video_paths: List of full paths to video files
+            labels: List of labels corresponding to each video
+            video_ids: Optional list of video IDs
+            fps: Frames per second to extract
+            duration: Duration in seconds to extract
+            is_train: Whether this is training mode
+            transform: Video transforms to apply
+            sample_strategy: 'random', 'center', or 'metadata_center'
+            center_time_column: Column name for center time (for 'metadata_center')
+            metadata_df: DataFrame with metadata (required for 'metadata_center')
+        """
+        self.video_paths = video_paths
+        self.labels = labels
+        self.video_ids = video_ids if video_ids is not None else list(range(len(video_paths)))
+        self.fps = fps
+        self.duration = duration
+        self.is_train = is_train
+        self.transform = transform
+        self.sample_strategy = sample_strategy
+        self.center_time_column = center_time_column
+        self.metadata_df = metadata_df
+        
+        # Validate inputs
+        assert len(video_paths) == len(labels), "video_paths and labels must have same length"
+        assert sample_strategy in ['random', 'center', 'metadata_center'], \
+            "sample_strategy must be 'random', 'center', or 'metadata_center'"
+        
+        if sample_strategy == 'metadata_center':
+            assert metadata_df is not None, "metadata_df required for 'metadata_center' strategy"
+            assert center_time_column is not None, "center_time_column required for 'metadata_center' strategy"
+            assert center_time_column in metadata_df.columns, f"Column '{center_time_column}' not found in metadata"
+
+    def __len__(self):
+        return len(self.video_paths)
+
+    def __getitem__(self, idx):
+        video_path = self.video_paths[idx]
+        label = self.labels[idx]
+        video_id = self.video_ids[idx]
+        
+        try:
+            # Load video
+            vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
+            num_frames = len(vr)
+            frames_needed = self.fps * self.duration
+            
+            # Determine start frame based on strategy
+            if self.sample_strategy == 'metadata_center':
+                # Get center time from metadata
+                center_time = self._get_center_time_from_metadata(idx)
+                if center_time is not None:
+                    # Get video FPS
+                    cap = cv2.VideoCapture(video_path)
+                    video_fps = cap.get(cv2.CAP_PROP_FPS)
+                    cap.release()
+                    
+                    if video_fps > 0:
+                        # Convert center time to frame number
+                        center_frame = int(center_time * video_fps)
+                        # Extract 2.5 seconds before and after (total 5 seconds)
+                        frames_half = frames_needed // 2
+                        start_frame = max(0, center_frame - frames_half)
+                        
+                        # Ensure we don't go beyond video bounds
+                        if start_frame + frames_needed > num_frames:
+                            start_frame = max(0, num_frames - frames_needed)
+                    else:
+                        start_frame = self._get_random_start_frame(num_frames, frames_needed)
+                else:
+                    start_frame = self._get_random_start_frame(num_frames, frames_needed)
+                    
+            elif self.sample_strategy == 'center':
+                # Extract from center of video
+                if num_frames > frames_needed:
+                    center_frame = num_frames // 2
+                    frames_half = frames_needed // 2
+                    start_frame = max(0, center_frame - frames_half)
+                    
+                    if start_frame + frames_needed > num_frames:
+                        start_frame = max(0, num_frames - frames_needed)
+                else:
+                    start_frame = 0
+                    
+            else:  # random
+                start_frame = self._get_random_start_frame(num_frames, frames_needed)
+            
+            # Ensure start_frame is within bounds
+            start_frame = max(0, min(start_frame, num_frames - 1))
+            end_frame = min(start_frame + frames_needed, num_frames)
+            
+            # Extract frames
+            indices = list(range(start_frame, end_frame))
+            frames = vr.get_batch(indices)
+            
+            # Convert to numpy if needed
+            if hasattr(frames, 'asnumpy'):
+                frames = frames.asnumpy()
+            
+            # Pad or trim frames to exact length
+            frames = self._ensure_frame_count(frames, frames_needed)
+            
+            # Convert to torch tensor and reshape to [C, T, H, W]
+            frames = torch.from_numpy(frames).permute(3, 0, 1, 2)
+            
+            # Apply transforms
+            if self.transform:
+                frames = self.transform(frames)
+            else:
+                frames = frames.float() / 255.0
+            
+            # Convert back to [T, H, W, C] for compatibility
+            frames = frames.permute(1, 2, 3, 0)
+            
+        except Exception as e:
+            print(f"Error loading video {video_path}: {e}")
+            # Return empty frames with standard size
+            channels = 3
+            if self.transform:
+                final_size = 224
+                frames = torch.zeros(self.fps * self.duration, final_size, final_size, channels)
+            else:
+                frames = torch.zeros(self.fps * self.duration, 720, 1280, channels)
+        
+        return {
+            'frames': frames,
+            'target': label,
+            'id': video_id
+        }
+    
+    def _get_random_start_frame(self, num_frames, frames_needed):
+        """Get random start frame"""
+        if num_frames > frames_needed:
+            return random.randint(0, num_frames - frames_needed)
+        return 0
+    
+    def _get_center_time_from_metadata(self, idx):
+        """Get center time from metadata for the given index"""
+        if self.metadata_df is None or self.center_time_column is None:
+            return None
+            
+        try:
+            video_id = self.video_ids[idx]
+            # Find matching row in metadata
+            metadata_row = self.metadata_df[self.metadata_df['id'] == video_id]
+            if len(metadata_row) > 0:
+                center_time = metadata_row.iloc[0][self.center_time_column]
+                return center_time if not pd.isna(center_time) else None
+        except Exception:
+            pass
+        return None
+    
+    def _ensure_frame_count(self, frames, target_count):
+        """Ensure frames array has exactly target_count frames"""
+        current_count = len(frames)
+        
+        if current_count < target_count:
+            # Pad with repeated last frame
+            if current_count > 0:
+                last_frame = frames[-1]
+                padding = np.repeat(last_frame[np.newaxis, :], target_count - current_count, axis=0)
+                frames = np.concatenate([frames, padding], axis=0)
+            else:
+                # No frames available, create black frames
+                h, w = 720, 1280  # default dimensions
+                frames = np.zeros((target_count, h, w, 3), dtype=np.uint8)
+                
+        elif current_count > target_count:
+            frames = frames[:target_count]
+            
+        return frames
+
+    def show_batch(self, batch=None, m=4, rows_per_page=2, fps=10, normalize=True, 
+                   temp_dir="./temp_videos", video_width=240, **kwargs):
+        """
+        Display a batch of videos in a grid layout
+        
+        Args:
+            batch: Batch of data to display (if None, will sample from dataset)
+            m: Number of videos per row in the grid
+            rows_per_page: Number of rows to display
+            fps: Frames per second for the output videos
+            normalize: Whether to denormalize the frames for display
+            temp_dir: Directory to store temporary video files
+            video_width: Width of videos in the HTML display
+            
+        Returns:
+            HTML display object
+        """
+        import os
+        import torch
+        import numpy as np
+        import uuid
+        from pathlib import Path
+        from IPython.display import HTML, display
+        from torch.utils.data import DataLoader
+        import imageio
+        
+        # Create directories
+        temp_dir = Path(temp_dir)
+        temp_dir.mkdir(exist_ok=True)
+        
+        # Create a unique subfolder to avoid conflicts
+        session_id = str(uuid.uuid4())[:8]
+        session_dir = temp_dir / session_id
+        session_dir.mkdir(exist_ok=True)
+        
+        # Get batch if not provided
+        total_videos = m * rows_per_page
+        if batch is None:
+            temp_loader = DataLoader(self, batch_size=total_videos, shuffle=True, num_workers=0)
+            batch = next(iter(temp_loader))
+        
+        frames = batch['frames']
+        targets = batch['target']
+        ids = batch['id']
+        
+        # Limit to requested number of videos
+        n_videos = min(len(frames), total_videos)
+        
+        # Convert tensors to numpy arrays if needed
+        if isinstance(frames, torch.Tensor):
+            frames = frames.cpu().numpy()
+        if isinstance(targets, torch.Tensor):
+            targets = targets.cpu().numpy()
+        if isinstance(ids, torch.Tensor):
+            ids = ids.cpu().numpy()
+        
+        # Get unique classes and assign colors
+        unique_classes = list(set([str(t) for t in targets]))
+        color_palette = ['#2ca02c', '#d62728', '#ff7f0e', '#1f77b4', '#9467bd', 
+                        '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+        class_colors = {cls: color_palette[i % len(color_palette)] 
+                       for i, cls in enumerate(unique_classes)}
+        
+        # Process videos
+        video_paths = []
+        video_titles = []
+        
+        # Define mean and std for denormalization
+        mean = np.array([0.45, 0.45, 0.45])
+        std = np.array([0.225, 0.225, 0.225])
+        
+        for i in range(n_videos):
+            # Get video frames
+            video_frames = frames[i].copy()
+            
+            # Denormalization
+            if normalize and (video_frames.min() < 0 or video_frames.max() > 1.0):
+                mean_reshaped = mean.reshape(1, 1, 1, 3)
+                std_reshaped = std.reshape(1, 1, 1, 3)
+                video_frames = video_frames * std_reshaped + mean_reshaped
+                video_frames = np.clip(video_frames, 0, 1)
+                video_frames = (video_frames * 255).astype(np.uint8)
+            elif normalize and video_frames.max() <= 1.0:
+                video_frames = (video_frames * 255).astype(np.uint8)
+            else:
+                video_frames = video_frames.astype(np.uint8)
+            
+            # Ensure correct shape
+            if len(video_frames.shape) == 3:
+                video_frames = np.repeat(video_frames[..., np.newaxis], 3, axis=-1)
+            elif video_frames.shape[-1] == 1:
+                video_frames = np.repeat(video_frames, 3, axis=-1)
+            
+            # Create title
+            target_value = str(targets[i])
+            title = f"{target_value} (ID: {ids[i]})"
+            video_titles.append(title)
+            
+            # Ensure even dimensions for video encoding
+            processed_frames = []
+            for frame in video_frames:
+                height, width = frame.shape[:2]
+                if height % 2 != 0 or width % 2 != 0:
+                    new_height = height + (height % 2)
+                    new_width = width + (width % 2)
+                    padded_frame = np.zeros((new_height, new_width, 3), dtype=np.uint8)
+                    padded_frame[:height, :width] = frame
+                    processed_frames.append(padded_frame)
+                else:
+                    processed_frames.append(frame)
+            
+            # Save video
+            temp_video_path = str(session_dir / f"video_{i}.mp4")
+            video_paths.append(temp_video_path)
+            
+            try:
+                imageio.mimwrite(temp_video_path, processed_frames, fps=fps, macro_block_size=1)
+            except Exception as e:
+                print(f"Error creating video {i}: {e}")
+        
+        # Create HTML with proper grid layout
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+.video-grid {{
+    display: grid;
+    grid-template-columns: repeat({m}, 1fr);
+    gap: 15px;
+    margin: 20px auto;
+    max-width: 1200px;
+}}
+.video-item {{
+    text-align: center;
+}}
+.video-title {{
+    font-weight: bold;
+    font-size: 14px;
+    margin-bottom: 8px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}}
+video {{
+    width: {video_width}px;
+    border: 2px solid #ddd;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}}
+</style>
+</head>
+<body>
+<h2>Video Batch</h2>
+<div class="video-grid">
+"""
+        
+        # Add videos to grid
+        for i, (path, title) in enumerate(zip(video_paths, video_titles)):
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                target_value = str(targets[i])
+                color = class_colors.get(target_value, '#000000')
+                
+                # Encode video as base64
+                try:
+                    from base64 import b64encode
+                    with open(path, 'rb') as f:
+                        mp4_data = f.read()
+                    data_url = f"data:video/mp4;base64,{b64encode(mp4_data).decode()}"
+                    
+                    html_content += f"""
+<div class="video-item">
+    <div class="video-title" style="color: {color};">{title}</div>
+    <video controls autoplay loop muted playsinline>
+        <source src="{data_url}" type="video/mp4">
+    </video>
+</div>
+"""
+                except Exception as e:
+                    print(f"Error encoding video {i}: {e}")
+        
+        html_content += """
+</div>
+</body>
+</html>
+"""
+        
+        # Display HTML
+        display_html = HTML(html_content)
+        display(display_html)
+        
+        # Clean up temporary files
+        import shutil
+        try:
+            import time
+            time.sleep(1)
+            shutil.rmtree(session_dir)
+        except Exception as e:
+            print(f"Warning: Could not remove temporary directory: {e}")
+        
+        return display_html
+
+
+def create_datasets_with_manual_split(metadata_df, video_path_column='video_path', 
+                                    label_column='video_type', id_column='id',
+                                    split_column='split', transform_train=None, 
+                                    transform_val=None, sample_strategy='random',
+                                    center_time_column=None, **dataset_kwargs):
+    """
+    Create train/val/test datasets from metadata DataFrame with manual split
+    
+    Args:
+        metadata_df: DataFrame containing video paths, labels, IDs, and split information
+        video_path_column: Column name containing video file paths
+        label_column: Column name containing labels
+        id_column: Column name containing video IDs
+        split_column: Column name containing split info ('train', 'val', 'test')
+        transform_train: Transform for training data
+        transform_val: Transform for validation/test data
+        sample_strategy: Sampling strategy ('random', 'center', 'metadata_center')
+        center_time_column: Column for center time (if using 'metadata_center')
+        **dataset_kwargs: Additional arguments for VideoDataset
+        
+    Returns:
+        tuple: (train_dataset, val_dataset, test_dataset)
+    """
+    # Validate inputs
+    required_columns = [video_path_column, label_column, id_column, split_column]
+    missing_columns = [col for col in required_columns if col not in metadata_df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+    
+    # Split data based on metadata
+    train_df = metadata_df[metadata_df[split_column].str.lower() == 'train']
+    val_df = metadata_df[metadata_df[split_column].str.lower() == 'val']
+    test_df = metadata_df[metadata_df[split_column].str.lower() == 'test']
+    
+    # Create datasets
+    def create_split_dataset(df, is_train=False):
+        if len(df) == 0:
+            return None
+        return VideoDataset(
+            video_paths=df[video_path_column].tolist(),
+            labels=df[label_column].tolist(),
+            video_ids=df[id_column].tolist(),
+            is_train=is_train,
+            transform=transform_train if is_train else transform_val,
+            sample_strategy=sample_strategy,
+            center_time_column=center_time_column,
+            metadata_df=metadata_df,
+            **dataset_kwargs
+        )
+    
+    train_dataset = create_split_dataset(train_df, is_train=True)
+    val_dataset = create_split_dataset(val_df, is_train=False)
+    test_dataset = create_split_dataset(test_df, is_train=False)
+    
+    return train_dataset, val_dataset, test_dataset
 
 class VideoClassifier:
     """
@@ -214,7 +637,7 @@ class VideoClassifier:
        
        if self.is_master:
            self.log(f"Data loaders created: Train={len(self.train_loader)}, Val={len(self.val_loader)}")
-       
+           
     def create_model(self):
         """Create the model"""
         from nexar_arch import EnhancedFrameCNN
@@ -237,7 +660,7 @@ class VideoClassifier:
     
         if self.is_master:
             self.log(f"Model created: {self.base_model} + {self.temporal_mode}, Classes: {self.num_classes}")
-    
+       
     def train(self, epochs=10):
         """Main training loop with comprehensive validation"""
         self.log(f"Starting training for {epochs} epochs")
@@ -543,6 +966,7 @@ class VideoClassifier:
 # ========================================================================================
 
 import random
+import pandas as pd
 
 def set_random_seeds(seed=42):
    """Set random seeds for reproducibility"""
@@ -560,16 +984,21 @@ def parse_args():
    parser = argparse.ArgumentParser(description='Nexar Video Classification - Complete Training Script')
    
    # Data parameters
-   parser.add_argument('--base-dirs', nargs='+', 
-                      default=["../data/research-nvidia-data/nvidia-1", "../data/research-nvidia-data/nvidia-2"],
-                      help='Base directories containing the data')
-   parser.add_argument('--metadata-csv', type=str, default="nvidia_new_train.csv",
+   parser.add_argument('--metadata-csv', type=str, default="df_encord_v1.csv",
                       help='Metadata CSV file path')
-   parser.add_argument('--sensor-subdir', type=str, default='signals',
-                      help='Sensor subdirectory name')
+   parser.add_argument('--video-path-column', type=str, default='video_path',
+                      help='Column name containing video file paths')
+   parser.add_argument('--label-column', type=str, default='video_type',
+                      help='Column name containing labels')
+   parser.add_argument('--id-column', type=str, default='id',
+                      help='Column name containing video IDs')
+   parser.add_argument('--split-column', type=str, default='split',
+                      help='Column name containing split info (train/val/test)')
    parser.add_argument('--sample-strategy', type=str, default='center',
-                      choices=['center', 'random', 'uniform'],
+                      choices=['center', 'random', 'metadata_center'],
                       help='Sampling strategy for video frames')
+   parser.add_argument('--center-time-column', type=str, default=None,
+                      help='Column name for center time (for metadata_center strategy)')
    
    # Model parameters
    parser.add_argument('--base-model', type=str, default='convnext_tiny',
@@ -586,6 +1015,12 @@ def parse_args():
                       help='Batch size per GPU')
    parser.add_argument('--learning-rate', type=float, default=1e-4,
                       help='Learning rate')
+   
+   # Video parameters
+   parser.add_argument('--fps', type=int, default=10,
+                      help='Frames per second to extract')
+   parser.add_argument('--duration', type=int, default=5,
+                      help='Duration in seconds to extract')
    
    # Experiment parameters
    parser.add_argument('--experiment-name', type=str, default=None,
@@ -658,19 +1093,51 @@ def run_single_experiment(args):
    # Create datasets
    log_info("Creating datasets...")
    
+   # Load metadata DataFrame
+   metadata_df = pd.read_csv(args.metadata_csv)
+   log_info(f"Loaded metadata with {len(metadata_df)} rows")
+   
+   # Create transforms (try to import, if not available use None)
+   try:
+       from nexar_video_aug import create_video_transforms
+       transform_train = create_video_transforms(
+           mode='train',
+           enable_custom_augmentation=True,
+           brightness_range=(0.95, 1.05),
+           contrast_range=(0.95, 1.05),
+           saturation_range=(0.95, 1.05),
+           hue_range=(-0.02, 0.02),
+           rotation_range=(-3, 3),
+           scale_range=(0.98, 1.02),
+           horizontal_flip_prob=0.5,
+           aug_probability=0.8,
+       )
+       transform_val = create_video_transforms(mode='val')
+       log_info("Using video transforms")
+   except ImportError:
+       transform_train, transform_val = None, None
+       log_info("No video transforms available - using default")
+   
+   # Create datasets using the new API
    train_data, val_data, test_data = create_datasets_with_manual_split(
-       base_dirs=args.base_dirs,
-       metadata_csv=args.metadata_csv,
-       seed=args.seed,
-       sensor_subdir=args.sensor_subdir,
+       metadata_df=metadata_df,
+       video_path_column=args.video_path_column,
+       label_column=args.label_column,
+       id_column=args.id_column,
+       split_column=args.split_column,
+       transform_train=transform_train,
+       transform_val=transform_val,
        sample_strategy=args.sample_strategy,
-       show_stats=is_main_process()
+       center_time_column=args.center_time_column,
+       # VideoDataset parameters
+       fps=args.fps,
+       duration=args.duration,
    )
    
    log_info(f"Dataset sizes:")
-   log_info(f"  Train: {len(train_data)}")
-   log_info(f"  Validation: {len(val_data)}")
-   log_info(f"  Test: {len(test_data)}")
+   log_info(f"  Train: {len(train_data) if train_data else 0}")
+   log_info(f"  Validation: {len(val_data) if val_data else 0}")
+   log_info(f"  Test: {len(test_data) if test_data else 0}")
    
    # Create the VideoClassifier
    log_info("Creating VideoClassifier...")
@@ -814,8 +1281,7 @@ def run_notebook_equivalent():
    set_random_seeds(seed)
    
    # Parameters
-   base_dirs = ["../data/research-nvidia-data/nvidia-1", "../data/research-nvidia-data/nvidia-2"]
-   metadata_csv = "nvidia_new_train.csv"
+   metadata_csv = "df_encord_v1.csv"
    base_model = "convnext_tiny"
    temporal_mode = "gru"
    batch_size = 8
@@ -826,17 +1292,46 @@ def run_notebook_equivalent():
    
    print("Creating datasets...")
    
-   # Create datasets
+   # Load metadata DataFrame
+   metadata_df = pd.read_csv(metadata_csv)
+   print(f"Loaded metadata with {len(metadata_df)} rows")
+   
+   # Create transforms (try to import, if not available use None)
+   try:
+       from nexar_video_aug import create_video_transforms
+       transform_train = create_video_transforms(
+           mode='train',
+           enable_custom_augmentation=True,
+           brightness_range=(0.95, 1.05),
+           contrast_range=(0.95, 1.05),
+           saturation_range=(0.95, 1.05),
+           hue_range=(-0.02, 0.02),
+           rotation_range=(-3, 3),
+           scale_range=(0.98, 1.02),
+           horizontal_flip_prob=0.5,
+           aug_probability=0.8,
+       )
+       transform_val = create_video_transforms(mode='val')
+       print("Using video transforms")
+   except ImportError:
+       transform_train, transform_val = None, None
+       print("No video transforms available - using default")
+   
+   # Create datasets using the new API
    train_data, val_data, test_data = create_datasets_with_manual_split(
-       base_dirs=base_dirs,
-       metadata_csv=metadata_csv,
-       seed=seed,
-       sensor_subdir='signals',
+       metadata_df=metadata_df,
+       video_path_column='video_path',  # אתה יכול לשנות בהתאם לשמות העמודות שלך
+       label_column='video_type',       # אתה יכול לשנות בהתאם לשמות העמודות שלך
+       id_column='id',                  # אתה יכול לשנות בהתאם לשמות העמודות שלך
+       split_column='split',            # אתה יכול לשנות בהתאם לשמות העמודות שלך
+       transform_train=transform_train,
+       transform_val=transform_val,
        sample_strategy='center',
-       show_stats=True
+       fps=10,
+       duration=5
    )
    
-   print(f"Dataset sizes: Train={len(train_data)}, Val={len(val_data)}, Test={len(test_data)}")
+   print(f"Dataset sizes: Train={len(train_data) if train_data else 0}, Val={len(val_data) if val_data else 0}, Test={len(test_data) if test_data else 0}")
    
    # Create classifier
    print("Creating VideoClassifier...")
@@ -925,15 +1420,20 @@ def test_single_gpu():
    
    # Minimal test arguments
    class TestArgs:
-       base_dirs = ["../data/research-nvidia-data/nvidia-1"]
-       metadata_csv = "nvidia_new_train.csv"
-       sensor_subdir = 'signals'
+       metadata_csv = "df_encord_v1.csv"
+       video_path_column = 'video_path'
+       label_column = 'video_type'
+       id_column = 'id'
+       split_column = 'split'
        sample_strategy = 'center'
+       center_time_column = None
        base_model = 'resnet18'
        temporal_mode = 'attention'
        epochs = 2  # Just 2 epochs for quick test
        batch_size = 4
        learning_rate = 1e-4
+       fps = 10
+       duration = 5
        experiment_name = f"test_{datetime.now().strftime('%H%M%S')}"
        save_dir = 'test_results'
        seed = 42
