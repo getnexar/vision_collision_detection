@@ -46,17 +46,19 @@ from sklearn.metrics import precision_recall_fscore_support, classification_repo
 
 from nexar_video_aug import create_video_transforms
 
-#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 # ========================================================================================
 # SIMPLE VIDEO CLASSIFIER CLASS WITH FIXED VALIDATION
 # ========================================================================================
 
 class VideoDataset(Dataset):
-    """Clean video dataset for loading video frames"""
+    """Simple optimized video dataset - no caching overhead"""
 
     def __init__(self, video_paths, labels, video_ids=None, fps=10, duration=5, 
-                 is_train=True, transform=None, sample_strategy='random', 
+                 is_train=True, transform=None, sample_strategy='metadata_center', 
                  center_time_column=None, metadata_df=None):
         """
         Args:
@@ -82,6 +84,11 @@ class VideoDataset(Dataset):
         self.center_time_column = center_time_column
         self.metadata_df = metadata_df
         
+        # Pre-compute only metadata that we need for metadata_center strategy
+        self._metadata_cache = {}
+        if sample_strategy == 'metadata_center':
+            self._precompute_fps_only()
+        
         # Validate inputs
         assert len(video_paths) == len(labels), "video_paths and labels must have same length"
         assert sample_strategy in ['random', 'center', 'metadata_center'], \
@@ -95,54 +102,52 @@ class VideoDataset(Dataset):
     def __len__(self):
         return len(self.video_paths)
 
+    def _precompute_fps_only(self):
+        """Pre-compute only FPS for metadata_center strategy"""
+        print("Pre-computing FPS for metadata_center strategy...")
+        for video_path in self.video_paths:
+            try:
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                cap.release()
+                self._metadata_cache[video_path] = fps if fps > 0 else 30.0
+            except Exception:
+                self._metadata_cache[video_path] = 30.0
+
     def __getitem__(self, idx):
         video_path = self.video_paths[idx]
         label = self.labels[idx]
         video_id = self.video_ids[idx]
         
         try:
-            # Load video
+            # Open VideoReader - simple and direct
             vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
             num_frames = len(vr)
             frames_needed = self.fps * self.duration
             
             # Determine start frame based on strategy
             if self.sample_strategy == 'metadata_center':
-                # Get center time from metadata
                 center_time = self._get_center_time_from_metadata(idx)
                 if center_time is not None:
-                    # Get video FPS
-                    cap = cv2.VideoCapture(video_path)
-                    video_fps = cap.get(cv2.CAP_PROP_FPS)
-                    cap.release()
-                    
-                    if video_fps > 0:
-                        # Convert center time to frame number
-                        center_frame = int(center_time * video_fps)
-                        # Extract 2.5 seconds before and after (total 5 seconds)
-                        frames_half = frames_needed // 2
-                        start_frame = max(0, center_frame - frames_half)
-                        
-                        # Ensure we don't go beyond video bounds
-                        if start_frame + frames_needed > num_frames:
-                            start_frame = max(0, num_frames - frames_needed)
-                    else:
-                        start_frame = self._get_random_start_frame(num_frames, frames_needed)
+                    # Use pre-computed FPS
+                    video_fps = self._metadata_cache.get(video_path, 30.0)
+                    center_frame = int(center_time * video_fps)
+                    frames_half = frames_needed // 2
+                    start_frame = max(0, center_frame - frames_half)
+                    if start_frame + frames_needed > num_frames:
+                        start_frame = max(0, num_frames - frames_needed)
                 else:
                     start_frame = self._get_random_start_frame(num_frames, frames_needed)
                     
             elif self.sample_strategy == 'center':
-                # Extract from center of video
                 if num_frames > frames_needed:
                     center_frame = num_frames // 2
                     frames_half = frames_needed // 2
                     start_frame = max(0, center_frame - frames_half)
-                    
                     if start_frame + frames_needed > num_frames:
                         start_frame = max(0, num_frames - frames_needed)
                 else:
                     start_frame = 0
-                    
             else:  # random
                 start_frame = self._get_random_start_frame(num_frames, frames_needed)
             
@@ -154,14 +159,16 @@ class VideoDataset(Dataset):
             indices = list(range(start_frame, end_frame))
             frames = vr.get_batch(indices)
             
-            # Convert to numpy if needed
+            # Convert to numpy
             if hasattr(frames, 'asnumpy'):
                 frames = frames.asnumpy()
+            elif isinstance(frames, torch.Tensor):
+                frames = frames.cpu().numpy()
             
-            # Pad or trim frames to exact length
+            # Ensure correct frame count
             frames = self._ensure_frame_count(frames, frames_needed)
             
-            # Convert to torch tensor and reshape to [C, T, H, W]
+            # Convert to torch tensor [C, T, H, W]
             frames = torch.from_numpy(frames).permute(3, 0, 1, 2)
             
             # Apply transforms
@@ -170,12 +177,11 @@ class VideoDataset(Dataset):
             else:
                 frames = frames.float() / 255.0
             
-            # Convert back to [T, H, W, C] for compatibility
+            # Convert back to [T, H, W, C]
             frames = frames.permute(1, 2, 3, 0)
             
         except Exception as e:
             print(f"Error loading video {video_path}: {e}")
-            # Return empty frames with standard size
             channels = 3
             if self.transform:
                 final_size = 224
@@ -188,7 +194,7 @@ class VideoDataset(Dataset):
             'target': label,
             'id': video_id
         }
-    
+
     def _get_random_start_frame(self, num_frames, frames_needed):
         """Get random start frame"""
         if num_frames > frames_needed:
@@ -202,7 +208,6 @@ class VideoDataset(Dataset):
             
         try:
             video_id = self.video_ids[idx]
-            # Find matching row in metadata
             metadata_row = self.metadata_df[self.metadata_df['id'] == video_id]
             if len(metadata_row) > 0:
                 center_time = metadata_row.iloc[0][self.center_time_column]
@@ -216,16 +221,13 @@ class VideoDataset(Dataset):
         current_count = len(frames)
         
         if current_count < target_count:
-            # Pad with repeated last frame
             if current_count > 0:
                 last_frame = frames[-1]
                 padding = np.repeat(last_frame[np.newaxis, :], target_count - current_count, axis=0)
                 frames = np.concatenate([frames, padding], axis=0)
             else:
-                # No frames available, create black frames
-                h, w = 720, 1280  # default dimensions
+                h, w = 720, 1280
                 frames = np.zeros((target_count, h, w, 3), dtype=np.uint8)
-                
         elif current_count > target_count:
             frames = frames[:target_count]
             
@@ -269,7 +271,7 @@ class VideoDataset(Dataset):
         # Get batch if not provided
         total_videos = m * rows_per_page
         if batch is None:
-            temp_loader = DataLoader(self, batch_size=total_videos, shuffle=True, num_workers=0)
+            temp_loader = DataLoader(self, batch_size=total_videos, shuffle=True, num_workers=8)
             batch = next(iter(temp_loader))
         
         frames = batch['frames']
@@ -601,43 +603,61 @@ class VideoClassifier:
            self.logger.info(message, extra=extra)
     
     def setup_data_loaders(self, train_dataset, val_dataset, test_dataset):
-       """Create data loaders"""
-       if self.distributed:
-           self.train_sampler = DistributedSampler(train_dataset, shuffle=True)
-           train_shuffle = False
-       else:
-           self.train_sampler = None
-           train_shuffle = True
+        """
+        Replace existing function - now with DistributedSampler for validation too
+        """
+        # Training data loader (same as before)
+        if self.distributed:
+            self.train_sampler = DistributedSampler(train_dataset, shuffle=True)
+            train_shuffle = False
+        else:
+            self.train_sampler = None
+            train_shuffle = True
+        
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=train_shuffle,
+            sampler=self.train_sampler,
+            num_workers=8,
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=True
+        )
+        
+        # Validation data loader - now distributed too!
+        if self.distributed:
+            self.val_sampler = DistributedSampler(
+                val_dataset, 
+                shuffle=False,  # Important! Validation must be deterministic
+                drop_last=False  # We want to see all samples
+            )
+            val_sampler = self.val_sampler
+        else:
+            val_sampler = None
+        
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=8,
+            persistent_workers=True,
+            pin_memory=True
+        )
+        
+        # Test data loader (unchanged)
+        self.test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=8,
+            persistent_workers=True,
+        )
+        
+        if self.is_master:
+            self.log(f"Data loaders created: Train={len(self.train_loader)}, Val={len(self.val_loader)}")
        
-       self.train_loader = DataLoader(
-           train_dataset,
-           batch_size=self.batch_size,
-           shuffle=train_shuffle,
-           sampler=self.train_sampler,
-           num_workers=0,
-           pin_memory=True,
-           drop_last=True
-       )
-       
-       # Validation loader - only master validates
-       self.val_loader = DataLoader(
-           val_dataset,
-           batch_size=self.batch_size,
-           shuffle=False,
-           num_workers=0,
-           pin_memory=True
-       )
-       
-       self.test_loader = DataLoader(
-           test_dataset,
-           batch_size=self.batch_size,
-           shuffle=False,
-           num_workers=0
-       )
-       
-       if self.is_master:
-           self.log(f"Data loaders created: Train={len(self.train_loader)}, Val={len(self.val_loader)}")
-           
     def create_model(self):
         """Create the model"""
         from nexar_arch import EnhancedFrameCNN
@@ -660,10 +680,10 @@ class VideoClassifier:
     
         if self.is_master:
             self.log(f"Model created: {self.base_model} + {self.temporal_mode}, Classes: {self.num_classes}")
-       
+    
     def train(self, epochs=10):
-        """Main training loop with comprehensive validation"""
-        self.log(f"Starting training for {epochs} epochs")
+        """Main training loop with distributed validation"""
+        self.log(f"Starting training for {epochs} epochs with DISTRIBUTED validation")
     
         for epoch in range(epochs):
             epoch_start_time = time.time()
@@ -674,10 +694,8 @@ class VideoClassifier:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     
-            # Validation (only master)
-            val_metrics = {}
-            if self.is_master:
-                val_metrics = self.validate()
+            # Distributed Validation - ALL GPUs participate!
+            val_metrics = self.validate()
     
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -688,7 +706,7 @@ class VideoClassifier:
     
             epoch_time = time.time() - epoch_start_time
     
-            # Update history (only master)
+            # Update history (only master saves, but all have the same data)
             if self.is_master:
                 self.training_history['epoch'].append(epoch + 1)
                 self.training_history['train_loss'].append(train_loss)
@@ -698,7 +716,7 @@ class VideoClassifier:
                     self.training_history[key].append(value)
     
                 # Log epoch summary
-                self.log(f"Epoch {epoch+1}/{epochs} Complete:")
+                self.log(f"Epoch {epoch+1}/{epochs} Complete (DISTRIBUTED VALIDATION):")
                 self.log(f"  Train Loss: {train_loss:.4f}")
                 self.log(f"  Val Loss: {val_metrics.get('val_loss', 'N/A'):.4f}")
                 self.log(f"  Val Accuracy: {val_metrics.get('val_accuracy', 'N/A'):.4f}")
@@ -712,7 +730,7 @@ class VideoClassifier:
                 torch.cuda.empty_cache()
     
         if self.is_master:
-            self.log("Training completed!")
+            self.log("Training completed with DISTRIBUTED VALIDATION!")
             self.log(f"Best validation loss achieved: {self.best_val_loss:.4f}")
     
     def train_epoch(self, epoch):
@@ -764,52 +782,135 @@ class VideoClassifier:
         return avg_loss
     
     def validate(self):
-        """Comprehensive validation with per-class metrics"""
-        if not self.is_master:
-            return {}
-        self.log(f"Starting validation on {len(self.val_loader)} batches...")
-    
+        """
+        Distributed validation - replace existing validate() function
+        All GPUs work in parallel, results are identical to master-only approach
+        """
+        self.log(f"Starting distributed validation on {len(self.val_loader)} batches per GPU...")
+        
         # Use non-DDP model for validation
         model_for_val = self.model.module if hasattr(self.model, 'module') else self.model
         model_for_val.eval()
-    
-        total_loss = 0.0
-        all_preds = []
-        all_targets = []
-        total_samples = 0
-    
+        
+        # Set epoch for validation sampler (for deterministic behavior)
+        if self.distributed and hasattr(self.val_sampler, 'set_epoch'):
+            self.val_sampler.set_epoch(0)  # Fixed for validation
+        
+        # Collect local results
+        local_preds = []
+        local_targets = []
+        local_loss = 0.0
+        local_samples = 0
+        
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validating", disable=not self.is_master):
+            iterator = tqdm(self.val_loader, desc="Validating", disable=not self.is_master)
+            
+            for batch in iterator:
                 frames = batch['frames'].permute(0, 4, 1, 2, 3).float().to(self.device)
                 targets = batch['target']
-    
+                
+                # Handle string targets
                 if isinstance(targets[0], str):
                     class_map = {'Normal': 0, 'Near Collision': 1, 'Collision': 2}
                     targets = torch.tensor([class_map[t] for t in targets]).to(self.device)
                 else:
                     targets = targets.to(self.device)
-    
+                
                 outputs = model_for_val(frames)
                 loss = self.criterion(outputs, targets)
-    
                 preds = torch.argmax(outputs, dim=1)
-    
-                all_preds.extend(preds.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
-                total_loss += loss.item() * targets.size(0)
-                total_samples += targets.size(0)
-    
+                
+                # Store local results
+                local_preds.extend(preds.cpu().numpy())
+                local_targets.extend(targets.cpu().numpy())
+                local_loss += loss.item() * targets.size(0)
+                local_samples += targets.size(0)
+                
                 del frames, targets, outputs, loss
-    
-        # Calculate metrics
+        
+        if not self.distributed:
+            # Single GPU - regular calculation
+            return self._calculate_metrics(local_preds, local_targets, local_loss, local_samples)
+        
+        # Distributed - gather from all GPUs and calculate on complete dataset
+        return self._gather_and_calculate_metrics(local_preds, local_targets, local_loss, local_samples)
+
+    def _gather_and_calculate_metrics(self, local_preds, local_targets, local_loss, local_samples):
+        """
+        Helper function to gather results from all GPUs and calculate metrics
+        PyTorch all_gather does all the heavy lifting!
+        """
+        # Convert to tensors for all_gather
+        local_preds_tensor = torch.tensor(local_preds, dtype=torch.long, device=self.device)
+        local_targets_tensor = torch.tensor(local_targets, dtype=torch.long, device=self.device)
+        local_loss_tensor = torch.tensor(local_loss, dtype=torch.float32, device=self.device)
+        local_samples_tensor = torch.tensor(local_samples, dtype=torch.long, device=self.device)
+        
+        # Prepare to receive results from all GPUs
+        world_size = self.world_size
+        
+        # all_gather requires all tensors to be the same size
+        # So first collect the sizes
+        all_sizes = [torch.zeros(1, dtype=torch.long, device=self.device) for _ in range(world_size)]
+        size_tensor = torch.tensor([len(local_preds)], dtype=torch.long, device=self.device)
+        dist.all_gather(all_sizes, size_tensor)
+        
+        # Find maximum size
+        max_size = max([size.item() for size in all_sizes])
+        
+        # Pad to maximum size
+        if len(local_preds) < max_size:
+            pad_size = max_size - len(local_preds)
+            local_preds_tensor = torch.cat([
+                local_preds_tensor, 
+                torch.zeros(pad_size, dtype=torch.long, device=self.device)
+            ])
+            local_targets_tensor = torch.cat([
+                local_targets_tensor,
+                torch.zeros(pad_size, dtype=torch.long, device=self.device)
+            ])
+        
+        # Gather predictions and targets
+        all_preds = [torch.zeros(max_size, dtype=torch.long, device=self.device) for _ in range(world_size)]
+        all_targets = [torch.zeros(max_size, dtype=torch.long, device=self.device) for _ in range(world_size)]
+        
+        dist.all_gather(all_preds, local_preds_tensor)
+        dist.all_gather(all_targets, local_targets_tensor)
+        
+        # Gather loss and samples (simpler - scalar values)
+        all_losses = [torch.zeros(1, dtype=torch.float32, device=self.device) for _ in range(world_size)]
+        all_samples_list = [torch.zeros(1, dtype=torch.long, device=self.device) for _ in range(world_size)]
+        
+        dist.all_gather(all_losses, local_loss_tensor.unsqueeze(0))
+        dist.all_gather(all_samples_list, local_samples_tensor.unsqueeze(0))
+        
+        # Calculate final metrics - all GPUs compute but result is identical
+        final_preds = []
+        final_targets = []
+        total_loss = 0.0
+        total_samples = 0
+        
+        for i in range(world_size):
+            actual_size = all_sizes[i].item()
+            final_preds.extend(all_preds[i][:actual_size].cpu().numpy())
+            final_targets.extend(all_targets[i][:actual_size].cpu().numpy())
+            total_loss += all_losses[i].item()
+            total_samples += all_samples_list[i].item()
+        
+        return self._calculate_metrics(final_preds, final_targets, total_loss, total_samples)
+
+    def _calculate_metrics(self, preds, targets, total_loss, total_samples):
+        """
+        Helper function to calculate metrics - shared between single and distributed
+        """
         avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
-        accuracy = np.mean(np.array(all_preds) == np.array(all_targets))
-    
+        accuracy = np.mean(np.array(preds) == np.array(targets))
+        
         # Per-class precision, recall, f1
         precision, recall, f1, _ = precision_recall_fscore_support(
-            all_targets, all_preds, average=None, zero_division=0, labels=[0, 1, 2]
+            targets, preds, average=None, zero_division=0, labels=[0, 1, 2]
         )
-    
+        
         metrics = {
             'val_loss': avg_loss,
             'val_accuracy': accuracy,
@@ -823,14 +924,15 @@ class VideoClassifier:
             'val_f1_near_collision': f1[1],
             'val_f1_collision': f1[2]
         }
-    
-        # Log detailed results
-        self.log(f"Validation Results:")
-        self.log(f"  Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
-        self.log(f"  Per-class Precision: Normal={precision[0]:.4f}, Near Collision={precision[1]:.4f}, Collision={precision[2]:.4f}")
-        self.log(f"  Per-class Recall: Normal={recall[0]:.4f}, Near Collision={recall[1]:.4f}, Collision={recall[2]:.4f}")
-        self.log(f"  Per-class F1: Normal={f1[0]:.4f}, Near Collision={f1[1]:.4f}, Collision={f1[2]:.4f}")
-    
+        
+        # Log results (all GPUs can log since results are identical)
+        if self.is_master:
+            self.log(f"Validation Results (DISTRIBUTED):")
+            self.log(f"  Loss: {avg_loss:.4f}, Accuracy: {accuracy:.4f}")
+            self.log(f"  Per-class Precision: Normal={precision[0]:.4f}, Near Collision={precision[1]:.4f}, Collision={precision[2]:.4f}")
+            self.log(f"  Per-class Recall: Normal={recall[0]:.4f}, Near Collision={recall[1]:.4f}, Collision={recall[2]:.4f}")
+            self.log(f"  Per-class F1: Normal={f1[0]:.4f}, Near Collision={f1[1]:.4f}, Collision={f1[2]:.4f}")
+        
         return metrics
     
     def save_training_history_csv(self):
@@ -994,11 +1096,14 @@ def parse_args():
                       help='Column name containing video IDs')
    parser.add_argument('--split-column', type=str, default='split',
                       help='Column name containing split info (train/val/test)')
-   parser.add_argument('--sample-strategy', type=str, default='center',
+   parser.add_argument('--sample-strategy', type=str, default='metadata_center',
                       choices=['center', 'random', 'metadata_center'],
                       help='Sampling strategy for video frames')
-   parser.add_argument('--center-time-column', type=str, default=None,
+   # parser.add_argument('--center-time-column', type=str, default=None,
+   #                    help='Column name for center time (for metadata_center strategy)')
+   parser.add_argument('--center-time-column', type=str, default='event_time_sec',
                       help='Column name for center time (for metadata_center strategy)')
+
    
    # Model parameters
    parser.add_argument('--base-model', type=str, default='convnext_tiny',
@@ -1320,13 +1425,13 @@ def run_notebook_equivalent():
    # Create datasets using the new API
    train_data, val_data, test_data = create_datasets_with_manual_split(
        metadata_df=metadata_df,
-       video_path_column='video_path',  # אתה יכול לשנות בהתאם לשמות העמודות שלך
-       label_column='video_type',       # אתה יכול לשנות בהתאם לשמות העמודות שלך
-       id_column='id',                  # אתה יכול לשנות בהתאם לשמות העמודות שלך
-       split_column='split',            # אתה יכול לשנות בהתאם לשמות העמודות שלך
+       video_path_column='video_path',
+       label_column='video_type',
+       id_column='id',
+       split_column='split',
        transform_train=transform_train,
        transform_val=transform_val,
-       sample_strategy='center',
+       sample_strategy='metadata_center',
        fps=10,
        duration=5
    )
@@ -1425,7 +1530,7 @@ def test_single_gpu():
        label_column = 'video_type'
        id_column = 'id'
        split_column = 'split'
-       sample_strategy = 'center'
+       sample_strategy = 'metadata_center'
        center_time_column = None
        base_model = 'resnet18'
        temporal_mode = 'attention'
