@@ -1086,7 +1086,7 @@ def parse_args():
    parser = argparse.ArgumentParser(description='Nexar Video Classification - Complete Training Script')
    
    # Data parameters
-   parser.add_argument('--metadata-csv', type=str, default="df_encord_v1.csv",
+   parser.add_argument('--metadata-csv', type=str, default="df_encord_v3.csv",
                       help='Metadata CSV file path')
    parser.add_argument('--video-path-column', type=str, default='video_path',
                       help='Column name containing video file paths')
@@ -1205,18 +1205,24 @@ def run_single_experiment(args):
    # Create transforms (try to import, if not available use None)
    try:
        from nexar_video_aug import create_video_transforms
-       transform_train = create_video_transforms(
-           mode='train',
-           enable_custom_augmentation=True,
-           brightness_range=(0.95, 1.05),
-           contrast_range=(0.95, 1.05),
-           saturation_range=(0.95, 1.05),
-           hue_range=(-0.02, 0.02),
-           rotation_range=(-3, 3),
-           scale_range=(0.98, 1.02),
-           horizontal_flip_prob=0.5,
-           aug_probability=0.8,
-       )
+       transform_train  = create_video_transforms(
+            mode='train',
+            enable_custom_augmentation=True,
+            brightness_range=(0.9, 1.1),
+            contrast_range=(0.9, 1.1),
+            saturation_range=(0.9, 1.1),
+            hue_range=(-0.05, 0.05),
+            rotation_range=(-7, 7),
+            scale_range=(0.95, 1.1),
+            translate_range=(0.0, 0.07),
+            grayscale_prob=0.02,
+            blur_sigma=0.5,
+            cutout_prob=0.1,
+            cutout_count=(1, 2),
+            cutout_size_range=(0.1, 0.15),
+            horizontal_flip_prob=0.5,
+            aug_probability=0.9
+        )
        transform_val = create_video_transforms(mode='val')
        log_info("Using video transforms")
    except ImportError:
@@ -1386,7 +1392,7 @@ def run_notebook_equivalent():
    set_random_seeds(seed)
    
    # Parameters
-   metadata_csv = "df_encord_v1.csv"
+   metadata_csv = "df_encord_v3.csv"
    base_model = "convnext_tiny"
    temporal_mode = "gru"
    batch_size = 8
@@ -1525,7 +1531,7 @@ def test_single_gpu():
    
    # Minimal test arguments
    class TestArgs:
-       metadata_csv = "df_encord_v1.csv"
+       metadata_csv = "df_encord_v3.csv"
        video_path_column = 'video_path'
        label_column = 'video_type'
        id_column = 'id'
